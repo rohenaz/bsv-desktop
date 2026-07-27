@@ -15,7 +15,9 @@
 import type { AtomicBEEF, WalletInterface } from '@bsv/sdk';
 import { STAS_BASKET } from '../../constants/baskets';
 import { buildChainedAtomicBeef } from './buildChainedAtomicBeef';
+import { isOutpointInBasket } from './basketOutpoints';
 import { verifyAndPersistOnReceive } from '../tokens/verifyOnReceive';
+import { encodeStasOutputMetadata } from './stasOutputMetadata';
 import type { ParsedDstas } from './dstasParser';
 
 /** Classic-STAS parsed payload extends ParsedDstas with optional symbol. */
@@ -67,6 +69,13 @@ export interface RegisterStasArgs {
    * sender's own token-change), so the wallet-toolbox output row already exists.
    */
   skipInternalize?: boolean;
+  /**
+   * Caller-supplied friendly label for a token the chain doesn't carry one for
+   * (DSTAS especially). Overrides the parsed symbol when present; stored in the
+   * output's customInstructions so it renders portably.
+   */
+  symbol?: string;
+  name?: string;
 }
 
 export interface RegisterStasResult {
@@ -91,21 +100,12 @@ export class StasRegistration {
     const { txid, vout, parsed, brc42KeyId, ownerFieldHash160, tokenSatoshis } = args;
     const protocol = args.protocol ?? DEFAULT_PROTOCOL;
 
-    // 1. Idempotency — skip outpoints that already live in stas_outputs.
-    try {
-      const existing = await this.stasQuery('findStasOutputByOutpoint', [txid, vout]);
-      if (existing) {
-        return {
-          registered: false,
-          txid,
-          vout,
-          outputId: existing.outputId,
-          reason: 'already registered',
-        };
-      }
-    } catch (err) {
-      // Query channel missing (e.g. unit tests without IPC) — proceed cautiously.
-      if (!isQueryUnavailable(err)) throw err;
+    // 1. Idempotency — skip outpoints already tracked in the token basket.
+    //    Storage-agnostic (listOutputs on the ACTIVE store); the old
+    //    satellite check (findStasOutputByOutpoint) was local-SQLite only, so
+    //    on remote it never recognised a held token and re-registered it.
+    if (await isOutpointInBasket(this.wallet, protocol.basketName, txid, vout, ORIGINATOR)) {
+      return { registered: false, txid, vout, reason: 'already registered' };
     }
 
     // 2. Build a chained AtomicBEEF. Walks back through inputs until every
@@ -135,12 +135,32 @@ export class StasRegistration {
     //    declared the output's basket at createAction time (e.g. a sender's own
     //    token-change) — internalizing it again would conflict; we only need the
     //    satellite linkage below.
-    const customInstructions = JSON.stringify({
+    // Encode the FULL token metadata onto the standard output record so the read
+    // paths can render + spend STAS/DSTAS from listOutputs alone — no local-only
+    // satellite tables. This is what makes these tokens survive remote storage,
+    // the same way BSV-21 already does. (Satellite rows are still written below
+    // during the transition; they become redundant once every reader is cut over.)
+    const richParsed = parsed as RichParsed;
+    // Prefer the on-chain/parsed symbol (classic STAS); fall back to a
+    // caller-supplied one (DSTAS, whose symbol isn't on-chain).
+    const effectiveSymbol = richParsed.symbol ?? args.symbol;
+    const encoded = encodeStasOutputMetadata({
+      kind: protocol.id === 'dstas' ? 'dstas' : 'stas',
       tokenId: parsed.tokenId,
       brc42KeyId,
+      ownerFieldHash160,
+      symbol: effectiveSymbol,
+      name: args.name ?? null,
       flagsHex: parsed.flagsHex,
+      freezeEnabled: parsed.freezeEnabled,
+      confiscationEnabled: parsed.confiscationEnabled,
+      redemptionPkh: parsed.tokenId === '' ? undefined : parsed.tokenId,
+      satoshisPerToken: 1,
       serviceFields: parsed.serviceFields,
+      frozen: false,
+      confiscated: false,
     });
+    const customInstructions = encoded.customInstructions;
     if (args.skipInternalize !== true) {
     try {
       await this.wallet.internalizeAction(
@@ -153,7 +173,7 @@ export class StasRegistration {
               insertionRemittance: {
                 basket: protocol.basketName,
                 customInstructions,
-                tags: [protocol.id],
+                tags: encoded.tags,
               },
             },
           ],
@@ -189,8 +209,11 @@ export class StasRegistration {
         await this.stasQuery('upsertStasToken', [
           {
             tokenId: parsed.tokenId,
-            symbol: (parsed as RichParsed).symbol ?? 'STAS',
-            name: undefined,
+            // Parsed ticker (classic STAS, from the OP_RETURN tail), else a
+            // caller-supplied one (DSTAS), else the protocol name — never a
+            // blanket 'STAS' that mislabels DSTAS.
+            symbol: effectiveSymbol ?? protocol.id.toUpperCase(),
+            name: args.name,
             satoshisPerToken: 1,
             freezeEnabled: parsed.freezeEnabled,
             confiscationEnabled: parsed.confiscationEnabled,
@@ -226,13 +249,21 @@ export class StasRegistration {
         await this.stasQuery('setOutputSpendable', [outputId, true]);
       }
     } catch (err) {
-      // The token is internalized regardless; satellite linkage is best-effort.
-      // Log but report registered=true so the discovery loop does not retry.
+      // Satellite linkage is a best-effort LOCAL optimization. The token is
+      // internalized into the basket regardless and renders from the basket read
+      // (Assets page, since the render unification). Log real failures; stay quiet
+      // on the benign no-IPC case (unit tests / no Electron bridge).
       if (!isQueryUnavailable(err)) {
         // eslint-disable-next-line no-console
         console.warn(`[StasRegistration] satellite linkage failed for ${txid}:${vout}`, err);
       }
     }
+
+    // NOTE: a missing local `outputs` row (remote/"cloud" storage — the satellite
+    // tables are local-SQLite only) is NOT a failure. The token is internalized
+    // into the basket and renders from the basket read; the satellite link is a
+    // local optimization we simply skip on remote. Reporting `registered:false`
+    // here used to make the peer-accept flow throw even though the token arrived.
 
     // Verify provenance the moment the token is ours — covers both the discovery
     // scan and peer-accept paths (both land here). Fire-and-forget; never blocks

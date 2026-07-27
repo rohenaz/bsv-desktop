@@ -21,8 +21,11 @@ import type { StasKeyDeriver } from './StasKeyDeriver';
 import type { StasRegistration } from './StasRegistration';
 import type { ScanProgressFn, WocUtxo } from '../tokens/woc/WocTokenIndexerClient';
 import { stasQuery } from './stasIpc';
-import { TOKEN_BASKETS } from '../../constants/baskets';
+import { TOKEN_BASKETS, STAS_BASKET, DSTAS_BASKET } from '../../constants/baskets';
+import { loadBasketOutpoints } from './basketOutpoints';
 import type { TokenProtocolRegistry, ParsedTokenOutput } from '../tokens';
+
+const ORIGINATOR = 'admin.stas-discovery';
 
 /**
  * Adapter-shaped parsed token output the legacy registration expects.
@@ -149,7 +152,17 @@ export class StasDiscoveryService {
    * matches. Useful too as a fallback when the address-based scan is
    * unavailable (e.g. WoC doesn't index custom-script outputs by address).
    */
-  async registerByTxid(txid: string): Promise<RegisterByTxidResult> {
+  /**
+   * `opts.symbol`/`opts.name` let a colocated minter supply a friendly label the
+   * chain doesn't carry — essential for DSTAS, whose symbol lives nowhere
+   * on-chain. When given, it's stored in the output's customInstructions so it
+   * renders portably (local + remote). Ignored for STAS, whose real symbol is
+   * recovered from the script.
+   */
+  async registerByTxid(
+    txid: string,
+    opts?: { symbol?: string; name?: string }
+  ): Promise<RegisterByTxidResult> {
     const out: RegisterByTxidResult = { txid, registered: 0, outputs: [] };
     const services: any = (this.deps.wallet as any).getServices?.();
     if (!services) {
@@ -212,6 +225,8 @@ export class StasDiscoveryService {
         brc42KeyId: `recv ${keyIndex}`,
         parsed: toRichParsed(match.parsed),
         protocol: { id: match.adapter.id, basketName: match.adapter.basketName },
+        symbol: opts?.symbol,
+        name: opts?.name,
       });
       const ok = !!reg.registered;
       if (ok) out.registered++;
@@ -312,6 +327,16 @@ export class StasDiscoveryService {
     }
     const txCache = new Map<string, Transaction>();
 
+    // Idempotency source: outpoints already tracked in the token baskets
+    // (STAS + DSTAS share the receive namespace). Read once from the ACTIVE
+    // store so re-scans skip tokens already held — the old per-UTXO satellite
+    // check (findStasOutputByOutpoint) was local-SQLite only and re-registered
+    // everything on remote storage each scan.
+    const knownOutpoints = new Set<string>([
+      ...(await loadBasketOutpoints(this.deps.wallet, STAS_BASKET, ORIGINATOR)),
+      ...(await loadBasketOutpoints(this.deps.wallet, DSTAS_BASKET, ORIGINATOR)),
+    ]);
+
     // Each work entry is bound to one owner hash160 by construction (the
     // indexer was queried per-derived-address / per-owner). That mapping is
     // the ownership fallback: if an adapter's parse can't recover an owner
@@ -325,16 +350,11 @@ export class StasDiscoveryService {
           // panel reflects "tokens the wallet recognises at the scanned range"
           // rather than just "newly registered this scan". Field names are
           // legacy STAS-era; treat as "recognised tokens" / "matched to a key".
-          try {
-            const existing = await stasQuery(identityKey, chain, 'findStasOutputByOutpoint', [utxo.txid, utxo.vout]);
-            if (existing) {
-              result.dstas++;
-              result.ownedAndDstas++;
-              result.skippedAlreadyKnown++;
-              continue;
-            }
-          } catch {
-            // Channel error: best-effort; let registration handle the duplicate.
+          if (knownOutpoints.has(`${utxo.txid}.${utxo.vout}`)) {
+            result.dstas++;
+            result.ownedAndDstas++;
+            result.skippedAlreadyKnown++;
+            continue;
           }
 
           // Prefer the indexer-supplied locking script (WOC `?script=true`)

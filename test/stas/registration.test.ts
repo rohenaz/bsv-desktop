@@ -176,4 +176,150 @@ describe('StasRegistration.register', () => {
     const txBytes = Array.from(calls[0].args.tx as number[])
     expect(txBytes.slice(0, 4)).toEqual([1, 1, 1, 1]) // AtomicBEEF prefix
   })
+
+  /**
+   * Remote storage: when the IPC query channel IS present but
+   * findOutputIdByOutpoint returns nothing (no local outputs row — the
+   * remote-storage case), register must still report registered:true. The token
+   * is internalized into the basket and renders from the basket read; the
+   * satellite link is a local-only optimization we skip on remote. (Reporting
+   * false here used to make the peer-accept flow throw even though the token
+   * arrived.)
+   */
+  function withStasQueryChannel(
+    handler: (method: string, args: any[]) => any
+  ): () => void {
+    const g = globalThis as any
+    const had = 'window' in g
+    const prev = g.window
+    g.window = {
+      electronAPI: {
+        stas: {
+          query: async (_id: string, _chain: string, method: string, args: any[]) => {
+            try {
+              return { success: true, result: handler(method, args) }
+            } catch (e) {
+              return { success: false, error: (e as Error).message }
+            }
+          },
+        },
+      },
+    }
+    return () => {
+      if (had) g.window = prev
+      else delete g.window
+    }
+  }
+
+  test('threads a caller-supplied symbol/name into customInstructions (DSTAS)', async () => {
+    // DSTAS carries no on-chain symbol; a colocated minter supplies it so it
+    // renders portably. It must land in the internalized output's metadata.
+    const ownerHash = 'cd'.repeat(20)
+    const { rawTx, txid } = makeDstasTx(ownerHash)
+    const { wallet, calls } = mkWallet(rawTx, txid)
+
+    const reg = new StasRegistration(wallet, 'test-identity', 'main')
+    await reg.register({
+      txid,
+      vout: 0,
+      tokenSatoshis: 100,
+      ownerFieldHash160: ownerHash,
+      brc42KeyId: 'recv 3',
+      parsed: {
+        ownerFieldHash160: ownerHash,
+        tokenId: 'ab'.repeat(20),
+        freezeEnabled: false,
+        confiscationEnabled: false,
+        flagsHex: '00',
+        serviceFields: [],
+      },
+      protocol: { id: 'dstas', basketName: 'dstas-tokens' },
+      symbol: 'EXDSTAS6',
+      name: 'Example DSTAS 6',
+    })
+
+    const ci = JSON.parse(calls[0].args.outputs[0].insertionRemittance.customInstructions)
+    expect(ci.kind).toBe('dstas')
+    expect(ci.symbol).toBe('EXDSTAS6')
+    expect(ci.name).toBe('Example DSTAS 6')
+    // and it surfaces as a sym: tag for filtering
+    expect(calls[0].args.outputs[0].insertionRemittance.tags).toContain('sym:EXDSTAS6')
+  })
+
+  test('reports registered:true on remote storage (satellite link skipped, token internalized)', async () => {
+    const ownerHash = 'cd'.repeat(20)
+    const { rawTx, txid } = makeDstasTx(ownerHash)
+    const { wallet, calls } = mkWallet(rawTx, txid)
+
+    // Channel is available, but findOutputIdByOutpoint returns undefined — as it
+    // does under remote storage, where the local `outputs` table is empty.
+    const restore = withStasQueryChannel((method) => {
+      if (method === 'findStasOutputByOutpoint') return undefined // not already registered
+      if (method === 'findOutputIdByOutpoint') return undefined // no local row
+      return undefined
+    })
+    try {
+      const reg = new StasRegistration(wallet, 'test-identity', 'main')
+      const result = await reg.register({
+        txid,
+        vout: 0,
+        tokenSatoshis: 100,
+        ownerFieldHash160: ownerHash,
+        brc42KeyId: 'recv 3',
+        parsed: {
+          ownerFieldHash160: ownerHash,
+          tokenId: 'ab'.repeat(20),
+          freezeEnabled: true,
+          confiscationEnabled: true,
+          flagsHex: '03',
+          serviceFields: [],
+        },
+      })
+      // Internalized into the basket (renders); satellite link skipped on remote.
+      expect(result.registered).toBe(true)
+      expect(result.outputId).toBeUndefined()
+      expect(calls).toHaveLength(1) // internalizeAction (basket insertion) happened
+    } finally {
+      restore()
+    }
+  })
+
+  test('reports registered:true and links satellites when a local output row exists', async () => {
+    const ownerHash = 'cd'.repeat(20)
+    const { rawTx, txid } = makeDstasTx(ownerHash)
+    const { wallet } = mkWallet(rawTx, txid)
+
+    const seen: string[] = []
+    const restore = withStasQueryChannel((method) => {
+      seen.push(method)
+      if (method === 'findStasOutputByOutpoint') return undefined
+      if (method === 'findOutputIdByOutpoint') return 4242 // local row exists
+      return undefined // upsert/insert/setSpendable are void
+    })
+    try {
+      const reg = new StasRegistration(wallet, 'test-identity', 'main')
+      const result = await reg.register({
+        txid,
+        vout: 0,
+        tokenSatoshis: 100,
+        ownerFieldHash160: ownerHash,
+        brc42KeyId: 'recv 3',
+        parsed: {
+          ownerFieldHash160: ownerHash,
+          tokenId: 'ab'.repeat(20),
+          freezeEnabled: true,
+          confiscationEnabled: true,
+          flagsHex: '03',
+          serviceFields: [],
+        },
+      })
+      expect(result.registered).toBe(true)
+      expect(result.outputId).toBe(4242)
+      expect(seen).toContain('upsertStasToken')
+      expect(seen).toContain('insertStasOutput')
+      expect(seen).toContain('setOutputSpendable')
+    } finally {
+      restore()
+    }
+  })
 })
