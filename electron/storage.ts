@@ -64,6 +64,9 @@ const ALLOWED_STORAGE_METHODS: ReadonlySet<string> = new Set([
   // Lifecycle & actions
   'destroy', 'migrate', 'findOrInsertUser', 'setActive',
   'abortAction', 'createAction', 'processAction', 'internalizeAction', 'listActions',
+  // Action batches (wallet-toolbox >= 2.4.4)
+  'getCapabilities', 'beginActionBatch', 'extendActionBatch', 'renewActionBatch',
+  'prepareActionBatchCommit', 'putActionBatchBlob', 'commitActionBatch', 'abortActionBatch',
 ]);
 
 // Lazy-load knex to avoid loading better-sqlite3 until actually needed
