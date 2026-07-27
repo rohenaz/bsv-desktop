@@ -34,6 +34,7 @@ import { broadcastAndInternalizeChange } from '../tokens/twoTx/internalizeChange
 import { StasRegistration } from './StasRegistration';
 import { parseClassicStasMetadata } from './parseClassicStasMetadata';
 import { tokenLog } from '../tokens/tokenLog';
+import { wocExplorerBase } from '../../utils/woc';
 
 async function loadStasDeps(): Promise<{
   bsv: any;
@@ -110,7 +111,7 @@ export class StasTransferService {
   constructor(
     private readonly wallet: WalletInterface,
     private readonly identityKey: string,
-    private readonly chain: 'main' | 'test'
+    private readonly chain: 'main' | 'test' | 'ttn'
   ) {}
 
   async transfer(args: StasTransferArgs): Promise<StasTransferResult> {
@@ -415,7 +416,7 @@ export class StasTransferService {
       return { ok: false, reason: `TX2 broadcast: ${errMsg(err)}` };
     }
 
-    const wocBase = this.chain === 'main' ? 'https://whatsonchain.com/tx/' : 'https://test.whatsonchain.com/tx/';
+    const wocBase = `${wocExplorerBase(this.chain)}/tx/`;
     tokenLog.info(`[stas-transfer] BROADCAST ✓ txid: ${tx2Txid}  ${wocBase}${tx2Txid}`);
 
     // 13. Register the sender's token-change (partial sends) as a basket insertion.

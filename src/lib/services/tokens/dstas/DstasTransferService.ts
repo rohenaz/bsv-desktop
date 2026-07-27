@@ -41,6 +41,7 @@ import { signP2pkhInput } from '../twoTx/p2pkhInput'
 import { broadcastAndInternalizeChange } from '../twoTx/internalizeChange'
 import { buildDstasUnlockingScript, DSTAS_SIGHASH_TYPE } from './buildDstasUnlockingScript'
 import { tokenLog } from '../tokenLog'
+import { wocExplorerBase } from '../../../utils/woc'
 
 /**
  * Dynamic bsv-js import — same pattern StasTransferService uses.
@@ -105,7 +106,7 @@ export class DstasTransferService {
   constructor(
     private readonly wallet: WalletInterface,
     private readonly identityKey: string,
-    private readonly chain: 'main' | 'test'
+    private readonly chain: 'main' | 'test' | 'ttn'
   ) {}
 
   async transfer(args: DstasTransferArgs): Promise<DstasTransferResult> {
@@ -367,7 +368,7 @@ export class DstasTransferService {
       return { ok: false, reason: `TX2 broadcast: ${errMsg(err)}` }
     }
 
-    const wocBase = this.chain === 'main' ? 'https://whatsonchain.com/tx/' : 'https://test.whatsonchain.com/tx/'
+    const wocBase = `${wocExplorerBase(this.chain)}/tx/`
     tokenLog.info(`[dstas-transfer] BROADCAST ✓ txid: ${tx2Txid}  ${wocBase}${tx2Txid}`)
 
     // 14. Register the sender's token-change (partial sends) as a basket insertion.

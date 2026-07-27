@@ -22,7 +22,7 @@ export interface SelfBrc29Output {
 
 export async function deriveSelfBrc29P2pkh(args: {
   wallet: WalletInterface;
-  chain: 'main' | 'test';
+  chain: 'main' | 'test' | 'ttn';
   originator: string;
   /** Optional: reuse existing nonces instead of minting fresh ones. */
   derivationPrefix?: string;

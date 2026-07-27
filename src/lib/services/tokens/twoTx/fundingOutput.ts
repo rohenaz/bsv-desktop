@@ -30,7 +30,7 @@ export interface TokenFundingOutput {
 
 export async function createTokenFundingOutput(args: {
   wallet: WalletInterface;
-  chain: 'main' | 'test';
+  chain: 'main' | 'test' | 'ttn';
   /** Satoshis to lock into the funding output (TX2 fee budget + dust margin). */
   satoshis: number;
   originator: string;
