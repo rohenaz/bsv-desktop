@@ -22,6 +22,9 @@ vi.mock('electron', () => ({
   app: { getPath: () => os.tmpdir() },
   dialog: { showMessageBox },
   BrowserWindow: class {},
+  // Probe unavailable, so trust falls back to inspecting the certificate store
+  // — these tests are about prompt timing, not about the probe.
+  net: { request: () => { throw new Error('probe unavailable in tests') } },
 }))
 
 // Every trust lookup fails, i.e. the certificate is not trusted and the app

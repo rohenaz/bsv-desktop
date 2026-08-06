@@ -1,4 +1,4 @@
-import { app, dialog, BrowserWindow } from 'electron';
+import { app, dialog, net, BrowserWindow } from 'electron';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
@@ -143,6 +143,164 @@ export function getCertSha1Thumbprint(certPem: string): string {
 }
 
 /**
+ * Distinguishes "certutil ran and said the certificate is not there" from
+ * "certutil could not run at all".
+ *
+ * NTE_NOT_FOUND (0x80090011 / -2146893807) is certutil's genuine answer for an
+ * absent certificate. Anything else — ENOENT because the binary is missing, a
+ * WDAC/AppLocker denial, an EDR kill — means we learned nothing and should try
+ * another route rather than reporting the certificate as untrusted.
+ */
+function isMissingCertError(error: unknown): boolean {
+  const err = error as { code?: number | string; stdout?: string; stderr?: string };
+
+  // Windows exit codes are DWORDs, and whether this one surfaces signed or
+  // unsigned is not worth depending on, so accept both. The output check below
+  // is the reliable signal: certutil always prints the code.
+  if (err?.code === -2146893807 || err?.code === 2148073489) return true;
+
+  const output = `${err?.stdout ?? ''}${err?.stderr ?? ''}`;
+  return output.includes('0x80090011') || output.includes('NTE_NOT_FOUND');
+}
+
+/** Runs a PowerShell one-liner, resolving its trimmed stdout. */
+async function runPowerShell(script: string): Promise<string> {
+  const { stdout } = await execFileAsync('powershell', [
+    '-NoProfile',
+    '-NonInteractive',
+    '-ExecutionPolicy', 'Bypass',
+    '-Command', script
+  ]);
+  return stdout.trim();
+}
+
+/** Single-quoted PowerShell literal, with embedded quotes escaped. */
+function psQuote(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+/**
+ * certutil-free trust lookup, for machines where certutil is blocked.
+ */
+async function isCertInStoreViaPowerShell(thumbprint: string): Promise<boolean> {
+  try {
+    const out = await runPowerShell(
+      `if (Test-Path ${psQuote(`Cert:\\CurrentUser\\Root\\${thumbprint.toUpperCase()}`)}) { 'FOUND' } else { 'MISSING' }`
+    );
+    return out.includes('FOUND');
+  } catch (error) {
+    console.error('PowerShell trust check also unavailable:', error);
+    return false;
+  }
+}
+
+/**
+ * Reports whether group policy restricts user-installed root certificates.
+ *
+ * This is only ever used to explain a failure we have already observed, never
+ * to predict one: the exact flag semantics are not worth guessing at, but the
+ * mere presence of the policy is a strong hint about why a certificate that
+ * installed successfully is still not being honoured.
+ */
+async function hasUserRootRestrictionPolicy(): Promise<boolean> {
+  try {
+    const { stdout } = await execFileAsync('reg', [
+      'query',
+      'HKLM\\SOFTWARE\\Policies\\Microsoft\\SystemCertificates\\Root\\ProtectedRoots',
+      '/v', 'Flags'
+    ]);
+    return stdout.includes('Flags');
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Local wallet bridge ports.
+ *
+ * Defined here rather than in httpServer so the trust probe below and the
+ * listeners cannot drift apart: a probe pointed at a port nobody serves would
+ * fail silently and look like a trust problem. httpServer imports these.
+ */
+export const HTTPS_BRIDGE_PORT = 2121;
+export const HTTP_BRIDGE_PORT = 3321;
+
+/** Probed to verify trust for real. Any HTTP response means TLS was accepted. */
+const HTTPS_PROBE_URL = `https://127.0.0.1:${HTTPS_BRIDGE_PORT}/manifest.json`;
+const HTTPS_PROBE_TIMEOUT_MS = 5_000;
+
+/**
+ * Asks the question that actually matters: does a real client accept our HTTPS
+ * endpoint?
+ *
+ * Electron's net module uses Chromium's network stack, which validates against
+ * the Windows certificate store exactly like the browsers and web apps that
+ * talk to the bridge. Node's own https client would not — it uses its bundled
+ * CA list and ignores the Windows store entirely, so it cannot answer this.
+ *
+ * This is ground truth, and it is why it runs before any store inspection.
+ * Store-based checks are heuristics about a store, and on managed Windows
+ * machines the store can say "installed" while the certificate is still not
+ * honoured — most notably when group policy forbids user-installed root CAs
+ * from being used for validation, in which case the install genuinely succeeds
+ * and is then quietly ignored. Probing the endpoint cannot be fooled by that.
+ *
+ * Returns null when the probe is inconclusive (server not up, timed out), so
+ * callers can fall back to inspecting the store rather than treating an
+ * unknown as untrusted and prompting needlessly.
+ */
+async function isCertAcceptedByClients(): Promise<boolean | null> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (result: boolean | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+
+    const timer = setTimeout(() => finish(null), HTTPS_PROBE_TIMEOUT_MS);
+
+    let request: Electron.ClientRequest;
+    try {
+      request = net.request({ method: 'GET', url: HTTPS_PROBE_URL });
+    } catch (error) {
+      console.log('Certificate probe could not be started:', error);
+      finish(null);
+      return;
+    }
+
+    // Any HTTP response at all means the TLS handshake was accepted; the status
+    // code is irrelevant.
+    request.on('response', (response) => {
+      response.on('data', () => { /* drain */ });
+      response.on('end', () => { /* no-op */ });
+      finish(true);
+    });
+
+    request.on('error', (error: Error & { code?: string }) => {
+      const code = error.code ?? '';
+      // Connection-level failures mean the server is not reachable yet, which
+      // says nothing about trust. Certificate failures are a real answer.
+      if (code === 'ECONNREFUSED' || code === 'ECONNRESET' || code === 'ENOTFOUND') {
+        console.log(`Certificate probe inconclusive (${code}): bridge not reachable`);
+        finish(null);
+        return;
+      }
+      console.log(`Certificate probe rejected the endpoint: ${code || error.message}`);
+      finish(false);
+    });
+
+    try {
+      request.end();
+    } catch (error) {
+      console.log('Certificate probe could not be sent:', error);
+      finish(null);
+    }
+  });
+}
+
+/**
  * Checks if the certificate is trusted by the system
  */
 async function isCertTrusted(certPath: string): Promise<boolean> {
@@ -170,8 +328,21 @@ async function isCertTrusted(certPath: string): Promise<boolean> {
       // we are actually serving, and it is not localized — matching on
       // certutil's human-readable output breaks on non-English Windows.
       const thumbprint = getCertSha1Thumbprint(fs.readFileSync(certPath, 'utf8'));
-      const { stdout } = await execFileAsync('certutil', ['-user', '-verifystore', 'Root', thumbprint]);
-      return stdout.toLowerCase().includes(thumbprint);
+
+      try {
+        const { stdout } = await execFileAsync('certutil', ['-user', '-verifystore', 'Root', thumbprint]);
+        return stdout.toLowerCase().includes(thumbprint);
+      } catch (certutilError) {
+        // certutil.exe is a well-known dual-use binary and is routinely blocked
+        // by WDAC, AppLocker or endpoint security on managed machines, where it
+        // fails the same way a missing certificate does. Confirm via PowerShell
+        // before concluding anything.
+        if (!isMissingCertError(certutilError)) {
+          console.log('certutil unavailable for trust check, falling back to PowerShell');
+          return await isCertInStoreViaPowerShell(thumbprint);
+        }
+        return false;
+      }
     } else {
       // Linux: Various cert stores, hard to check reliably
       return false;
@@ -240,13 +411,22 @@ async function showDialog(
 }
 
 /**
+ * Outcome of offering to install the certificate.
+ *
+ * Kept distinct because they warrant different follow-up: only an attempted
+ * install is worth verifying, and only a verified-failed install is worth
+ * warning about. Telling a user who chose "Not Now" that their connection is
+ * broken would be scolding them for a decision they deliberately made.
+ */
+type InstallOutcome = 'installed' | 'declined' | 'failed';
+
+/**
  * Attempts to install the certificate to the system trust store
- * Returns true if successful or user dismissed, false if failed
  */
 async function installCertificate(
   certPath: string,
   parentWindow?: BrowserWindow | null
-): Promise<boolean> {
+): Promise<InstallOutcome> {
   const platform = process.platform;
 
   let instructions = '';
@@ -284,11 +464,11 @@ Certificate location: ${certPath}`;
 
   // User clicked "Not Now" or dismissed
   if (response.response !== 0) {
-    return true;
+    return 'declined';
   }
 
   if (!canAutoInstall) {
-    return true; // Just showed instructions
+    return 'declined'; // Linux: instructions shown, nothing installed for them
   }
 
   try {
@@ -313,19 +493,21 @@ Certificate location: ${certPath}`;
         ]);
       }
 
-      return true;
+      return 'installed';
     } else if (platform === 'win32') {
-      // Windows: Import to Trusted Root store
-      await execFileAsync('certutil', ['-addstore', '-user', 'Root', certPath]);
+      // Windows: Import to Trusted Root store.
+      try {
+        await execFileAsync('certutil', ['-addstore', '-user', 'Root', certPath]);
+      } catch (certutilError) {
+        // certutil is commonly blocked by WDAC/AppLocker/EDR on managed
+        // machines. PowerShell's PKI module reaches the same store without it.
+        console.log('certutil could not install the certificate, falling back to PowerShell:', certutilError);
+        await runPowerShell(
+          `Import-Certificate -FilePath ${psQuote(certPath)} -CertStoreLocation Cert:\\CurrentUser\\Root | Out-Null`
+        );
+      }
 
-      // await dialog.showMessageBox({
-      //   type: 'info',
-      //   title: 'Certificate Installed',
-      //   message: 'The SSL certificate has been successfully installed and trusted.',
-      //   buttons: ['OK']
-      // });
-
-      return true;
+      return 'installed';
     }
   } catch (error) {
     console.error('Failed to install certificate:', error);
@@ -338,10 +520,10 @@ Certificate location: ${certPath}`;
       buttons: ['OK']
     });
 
-    return false;
+    return 'failed';
   }
 
-  return true;
+  return 'installed';
 }
 
 /**
@@ -354,7 +536,16 @@ export async function ensureCertTrusted(
   certPath: string,
   parentWindow?: BrowserWindow | null
 ): Promise<void> {
-  const trusted = await isCertTrusted(certPath);
+  // Ask a real client first. If the endpoint already works there is nothing to
+  // fix, whatever any certificate store happens to say.
+  const accepted = await isCertAcceptedByClients();
+  if (accepted === true) {
+    console.log('Certificate accepted by the network stack, nothing to do');
+    return;
+  }
+
+  // Inconclusive probe (bridge not reachable yet) falls back to the store.
+  const trusted = accepted === null ? await isCertTrusted(certPath) : false;
 
   if (trusted) {
     console.log('Certificate already trusted');
@@ -372,15 +563,63 @@ export async function ensureCertTrusted(
   }
 
   console.log('Certificate not trusted, attempting to install...');
-  const success = await installCertificate(certPath, parentWindow);
+  const outcome = await installCertificate(certPath, parentWindow);
 
-  if (success) {
-    // Verify it actually worked
-    const nowTrusted = await isCertTrusted(certPath);
-    if (nowTrusted) {
-      console.log('Certificate successfully installed and verified');
-    } else {
-      console.log('Certificate install reported success but verification failed');
-    }
+  // 'declined' is the user's call and needs no follow-up; 'failed' already
+  // showed its own error. Only an attempted install is worth verifying.
+  if (outcome !== 'installed') {
+    return;
   }
+
+  // Verify against a real client again, not just the store. On managed Windows
+  // machines the two can disagree: the certificate is genuinely in the store
+  // and genuinely not honoured.
+  const nowAccepted = await isCertAcceptedByClients();
+  if (nowAccepted === true) {
+    console.log('Certificate successfully installed and verified');
+    return;
+  }
+
+  if (nowAccepted === null && await isCertTrusted(certPath)) {
+    console.log('Certificate installed; endpoint not reachable to confirm end to end');
+    return;
+  }
+
+  console.log('Certificate install reported success but verification failed');
+  await explainVerificationFailure(certPath, parentWindow);
+}
+
+/**
+ * Tells the user why a certificate that installed cleanly still is not trusted.
+ *
+ * Without this the app looks like it silently did nothing: the install succeeds,
+ * the prompt disappears, and connectivity stays broken with no explanation. The
+ * usual cause on a corporate or university machine is a policy that forbids
+ * user-installed root CAs from being used for validation, which no amount of
+ * retrying will overcome — it needs an administrator.
+ */
+async function explainVerificationFailure(
+  certPath: string,
+  parentWindow?: BrowserWindow | null
+): Promise<void> {
+  const policyRestricted = process.platform === 'win32' && await hasUserRootRestrictionPolicy();
+
+  const detail = policyRestricted
+    ? 'The certificate was installed, but this device has a policy that prevents '
+      + 'user-installed root certificates from being trusted, so it is being ignored.\n\n'
+      + 'An administrator will need to deploy the certificate for you, or allow '
+      + 'user-installed root certificates.\n\n'
+      + `Certificate location: ${certPath}`
+    : 'The certificate was installed, but the secure local connection is still '
+      + 'being rejected. This is usually caused by security software or device '
+      + 'management policy on this machine.\n\n'
+      + `Certificate location: ${certPath}`;
+
+  await showDialog(parentWindow, {
+    type: 'warning',
+    title: 'Certificate Not Trusted',
+    message: 'BSV Desktop could not establish a trusted local connection',
+    detail,
+    buttons: ['OK']
+  });
 }
