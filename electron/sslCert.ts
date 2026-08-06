@@ -130,6 +130,19 @@ export async function generateSelfSignedCert(): Promise<CertificateKeyPair> {
 }
 
 /**
+ * SHA-1 thumbprint of a PEM certificate, lowercase hex.
+ *
+ * This is the identifier certutil prints as "Cert Hash(sha1)" and accepts as a
+ * certificate ID, so it lets us ask Windows about the exact certificate we are
+ * serving rather than about anything that happens to share a name.
+ */
+export function getCertSha1Thumbprint(certPem: string): string {
+  const cert = forge.pki.certificateFromPem(certPem);
+  const der = forge.asn1.toDer(forge.pki.certificateToAsn1(cert)).getBytes();
+  return forge.md.sha1.create().update(der).digest().toHex().toLowerCase();
+}
+
+/**
  * Checks if the certificate is trusted by the system
  */
 async function isCertTrusted(certPath: string): Promise<boolean> {
@@ -142,9 +155,23 @@ async function isCertTrusted(certPath: string): Promise<boolean> {
       await execFileAsync('security', ['verify-cert', '-c', certPath, '-p', 'ssl', '-s', 'localhost']);
       return true;
     } else if (process.platform === 'win32') {
-      // Windows: Check if cert is in trusted root store
-      const { stdout } = await execFileAsync('certutil', ['-user', '-verifystore', 'Root', 'BSV Desktop']);
-      return stdout.includes('BSV Desktop');
+      // Windows: look the certificate up in the user's trusted root store by its
+      // SHA-1 thumbprint.
+      //
+      // This used to search for "BSV Desktop", which never matched: certutil
+      // resolves a name-style certificate ID against the common name, and the
+      // CN here is "localhost" — "BSV Desktop" is only the organization. The
+      // lookup therefore failed with NTE_NOT_FOUND even when the certificate
+      // was installed and valid, execFileAsync rejected on the non-zero exit,
+      // and the app re-prompted on every single launch.
+      //
+      // The thumbprint is also exact, so a stale localhost certificate left in
+      // the store by an earlier install can no longer be mistaken for the one
+      // we are actually serving, and it is not localized — matching on
+      // certutil's human-readable output breaks on non-English Windows.
+      const thumbprint = getCertSha1Thumbprint(fs.readFileSync(certPath, 'utf8'));
+      const { stdout } = await execFileAsync('certutil', ['-user', '-verifystore', 'Root', thumbprint]);
+      return stdout.toLowerCase().includes(thumbprint);
     } else {
       // Linux: Various cert stores, hard to check reliably
       return false;
