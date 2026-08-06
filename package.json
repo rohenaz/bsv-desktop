@@ -15,6 +15,7 @@
     "build:renderer": "tsc && vite build",
     "build:electron": "tsc -p tsconfig.electron.json && cp electron/storage-loader.cjs electron/updater.cjs dist-electron/",
     "icons": "bash scripts/generate-icons.sh",
+    "verify:update-metadata": "node scripts/verify-update-metadata.mjs",
     "package": "electron-builder",
     "package:mac": "electron-builder --mac",
     "package:win": "electron-builder --win",
@@ -148,7 +149,14 @@
       ],
       "icon": "build/icon.ico",
       "verifyUpdateCodeSignature": false,
-      "artifactName": "${productName}-Setup-${version}.${ext}"
+      "artifactName": "${productName}-Setup-${version}.${ext}",
+      "signtoolOptions": {
+        "sign": "build/win-sign.cjs",
+        "signingHashAlgorithms": [
+          "sha256"
+        ],
+        "rfc3161TimeStampServer": "http://timestamp.digicert.com"
+      }
     },
     "nsis": {
       "oneClick": false,
