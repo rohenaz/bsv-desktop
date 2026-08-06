@@ -3,7 +3,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { createRequire } from 'module';
 import fs from 'fs';
-import { startHttpServer } from './httpServer.js';
+import { startHttpServer, PortInUseError } from './httpServer.js';
 import { buildApplicationMenu } from './appMenu.js';
 import { applyPersistedProxySettings, registerNetworkIpc } from './networkSettings.js';
 
@@ -723,9 +723,31 @@ app.whenReady().then(async () => {
 
   // Start HTTPS server on port 2121
   if (mainWindow) {
-    httpServerCleanup = await startHttpServer(mainWindow);
+    try {
+      httpServerCleanup = await startHttpServer(mainWindow);
+    } catch (error) {
+      // The wallet bridge failing is serious but not a reason to vanish without
+      // a word, which is what a port conflict used to do. Explain it and keep
+      // the app open so the user can read the message and act on it.
+      console.error('[Startup] Failed to start the local wallet bridge:', error);
 
-    // Initialize auto-updater
+      const detail = error instanceof PortInUseError
+        ? error.message
+        : `The local wallet bridge could not be started.\n\n${(error as Error)?.message ?? String(error)}`;
+
+      dialog.showMessageBox(mainWindow, {
+        type: 'error',
+        title: 'Wallet Bridge Unavailable',
+        message: 'BSV Desktop could not start its local connection',
+        detail: `${detail}\n\nApplications will not be able to connect to your wallet until this is resolved.`,
+        buttons: ['OK']
+      }).catch((dialogError) => {
+        console.error('[Startup] Failed to show bridge error dialog:', dialogError);
+      });
+    }
+
+    // Initialize auto-updater regardless: updates must keep working even when
+    // the bridge does not, since an update may be what fixes the bridge.
     const { initAutoUpdater } = getUpdaterModule();
     initAutoUpdater(mainWindow);
   }
