@@ -1,4 +1,4 @@
-import { app, dialog } from 'electron';
+import { app, dialog, BrowserWindow } from 'electron';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
@@ -181,11 +181,72 @@ async function isCertTrusted(certPath: string): Promise<boolean> {
   }
 }
 
+/** How long to wait for the main window before prompting anyway. */
+const WINDOW_VISIBLE_TIMEOUT_MS = 15_000;
+
+/**
+ * Resolves once the main window is actually on screen.
+ *
+ * The trust prompt used to appear before the app window did: the window is
+ * created with `show: false` and only shown on 'ready-to-show', which waits for
+ * the renderer's first paint, while the certificate work starts immediately
+ * after createWindow(). On a cold start the dialog reliably won the race, so
+ * the first thing a new user saw was an unexplained certificate prompt floating
+ * over the desktop with no application behind it — and most people dismissed
+ * it, leaving the HTTPS substrate untrusted.
+ *
+ * Falls through after a timeout so a window that never paints can never leave
+ * the user unable to trust the certificate at all.
+ */
+async function waitForWindowVisible(window: BrowserWindow): Promise<void> {
+  if (window.isDestroyed() || window.isVisible()) {
+    return;
+  }
+
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      window.off('show', done);
+      window.off('closed', done);
+      resolve();
+    };
+
+    const timer = setTimeout(() => {
+      console.log('Main window not visible after timeout, showing certificate prompt anyway');
+      done();
+    }, WINDOW_VISIBLE_TIMEOUT_MS);
+
+    window.once('show', done);
+    window.once('closed', done);
+  });
+}
+
+/**
+ * Shows a message box parented to the main window when one is available, so the
+ * dialog is window-modal and visibly attached to the app rather than being a
+ * free-floating top-level window with its own taskbar entry.
+ */
+async function showDialog(
+  parentWindow: BrowserWindow | null | undefined,
+  options: Electron.MessageBoxOptions
+): Promise<Electron.MessageBoxReturnValue> {
+  if (parentWindow && !parentWindow.isDestroyed()) {
+    return dialog.showMessageBox(parentWindow, options);
+  }
+  return dialog.showMessageBox(options);
+}
+
 /**
  * Attempts to install the certificate to the system trust store
  * Returns true if successful or user dismissed, false if failed
  */
-async function installCertificate(certPath: string): Promise<boolean> {
+async function installCertificate(
+  certPath: string,
+  parentWindow?: BrowserWindow | null
+): Promise<boolean> {
   const platform = process.platform;
 
   let instructions = '';
@@ -211,7 +272,7 @@ sudo update-ca-certificates
 Certificate location: ${certPath}`;
   }
 
-  const response = await dialog.showMessageBox({
+  const response = await showDialog(parentWindow, {
     type: 'info',
     title: 'SSL Certificate Trust',
     message: 'BSV Desktop uses HTTPS for secure communication',
@@ -269,7 +330,7 @@ Certificate location: ${certPath}`;
   } catch (error) {
     console.error('Failed to install certificate:', error);
 
-    await dialog.showMessageBox({
+    await showDialog(parentWindow, {
       type: 'error',
       title: 'Certificate Installation Failed',
       message: 'Failed to install the certificate automatically.',
@@ -284,9 +345,15 @@ Certificate location: ${certPath}`;
 }
 
 /**
- * Prompts user to trust the certificate if not already trusted
+ * Prompts user to trust the certificate if not already trusted.
+ *
+ * Pass the main window so the prompt can wait for it and parent itself to it.
+ * Without that, the prompt appears before the app does on a cold start.
  */
-export async function ensureCertTrusted(certPath: string): Promise<void> {
+export async function ensureCertTrusted(
+  certPath: string,
+  parentWindow?: BrowserWindow | null
+): Promise<void> {
   const trusted = await isCertTrusted(certPath);
 
   if (trusted) {
@@ -294,8 +361,18 @@ export async function ensureCertTrusted(certPath: string): Promise<void> {
     return;
   }
 
+  // Only wait once we know we actually need to prompt — the common case is
+  // already-trusted, and that must stay a silent no-op.
+  if (parentWindow && !parentWindow.isDestroyed()) {
+    await waitForWindowVisible(parentWindow);
+    if (parentWindow.isDestroyed()) {
+      console.log('Main window closed before the certificate prompt could be shown');
+      return;
+    }
+  }
+
   console.log('Certificate not trusted, attempting to install...');
-  const success = await installCertificate(certPath);
+  const success = await installCertificate(certPath, parentWindow);
 
   if (success) {
     // Verify it actually worked

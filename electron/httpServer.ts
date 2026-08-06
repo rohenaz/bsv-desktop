@@ -268,9 +268,6 @@ export async function startHttpServer(mainWindow: BrowserWindow): Promise<() => 
   // Generate self-signed certificate
   const { cert, key, certPath } = await generateSelfSignedCert();
 
-  // Prompt user to trust certificate if needed
-  await ensureCertTrusted(certPath);
-
   // Start HTTPS server (2121) + HTTP fallback (3321)
   const server: Server = await new Promise((resolve, reject) => {
     const srv = https.createServer({ cert, key }, app);
@@ -290,6 +287,16 @@ export async function startHttpServer(mainWindow: BrowserWindow): Promise<() => 
       }
       reject(error);
     });
+  });
+
+  // Prompt the user to trust the certificate, once the main window is on screen.
+  //
+  // Deliberately not awaited: the servers are already listening, and startup
+  // must not block on a dialog the user may leave sitting there. Trusting the
+  // certificate affects whether clients accept the HTTPS endpoint, not whether
+  // it comes up.
+  void ensureCertTrusted(certPath, mainWindow).catch((error) => {
+    console.error('Certificate trust check failed:', error);
   });
 
   // Return cleanup function
