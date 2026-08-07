@@ -21,6 +21,7 @@ const showMessageBox = vi.fn(async () => ({ response: 1, checkboxChecked: false 
 vi.mock('electron', () => ({
   app: { getPath: () => os.tmpdir() },
   dialog: { showMessageBox },
+  clipboard: { writeText: () => {} },
   BrowserWindow: class {},
   // Probe unavailable, so trust falls back to inspecting the certificate store
   // — these tests are about prompt timing, not about the probe.

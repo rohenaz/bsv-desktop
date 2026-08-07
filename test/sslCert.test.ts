@@ -18,6 +18,7 @@ import forge from 'node-forge'
 vi.mock('electron', () => ({
   app: { getPath: () => '/tmp/bsv-desktop-test' },
   dialog: { showMessageBox: async () => ({ response: 1 }) },
+  clipboard: { writeText: () => {} },
   net: { request: () => { throw new Error('probe unavailable in tests') } },
 }))
 

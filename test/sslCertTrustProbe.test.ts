@@ -50,6 +50,7 @@ const request = vi.fn(() => new FakeClientRequest())
 vi.mock('electron', () => ({
   app: { getPath: () => os.tmpdir() },
   dialog: { showMessageBox },
+  clipboard: { writeText: () => {} },
   BrowserWindow: class {},
   net: { request },
 }))
