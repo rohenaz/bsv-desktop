@@ -178,7 +178,9 @@
       "category": "Finance",
       "icon": "build/icons",
       "desktop": {
-        "StartupWMClass": "bsv-desktop-electron"
+        "entry": {
+          "StartupWMClass": "bsv-desktop-electron"
+        }
       }
     }
   }
