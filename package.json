@@ -99,7 +99,8 @@
     "files": [
       "dist/**/*",
       "dist-electron/**/*",
-      "package.json"
+      "package.json",
+      "build/icon.png"
     ],
     "asarUnpack": [
       "node_modules/better-sqlite3/**"
@@ -167,7 +168,10 @@
         "rpm"
       ],
       "category": "Finance",
-      "icon": "build/icon.png"
+      "icon": "build/icons",
+      "desktop": {
+        "StartupWMClass": "bsv-desktop-electron"
+      }
     }
   }
 }
