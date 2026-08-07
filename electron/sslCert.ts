@@ -1,4 +1,4 @@
-import { app, dialog } from 'electron';
+import { app, clipboard, dialog } from 'electron';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
@@ -7,6 +7,46 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 
 const execFileAsync = promisify(execFile);
+
+// Linux trust store locations. The system store is read by OpenSSL-based
+// clients; the NSS user db is what Chrome/Chromium actually consult for
+// user-added anchors, so we write to both when the tooling is available.
+const LINUX_CA_DIR = '/usr/local/share/ca-certificates';
+const LINUX_CA_PATH = path.join(LINUX_CA_DIR, 'bsv-desktop.crt');
+const LINUX_NSSDB_DIR = path.join(os.homedir(), '.pki', 'nssdb');
+const LINUX_NSSDB = `sql:${LINUX_NSSDB_DIR}`;
+const NSS_NICKNAME = 'BSV Desktop localhost';
+
+/** The commands a user would run by hand, shown when automation is unavailable. */
+function linuxManualCommand(certPath: string): string {
+  return [
+    `sudo cp "${certPath}" ${LINUX_CA_PATH}`,
+    'sudo update-ca-certificates'
+  ].join('\n');
+}
+
+/** SHA-256 fingerprint of a PEM certificate, lowercase hex. */
+function certFingerprint(pem: string): string {
+  const parsed = forge.pki.certificateFromPem(pem);
+  const der = forge.asn1.toDer(forge.pki.certificateToAsn1(parsed)).getBytes();
+  const md = forge.md.sha256.create();
+  md.update(der);
+  return md.digest().toHex();
+}
+
+async function hasCommand(command: string): Promise<boolean> {
+  try {
+    await execFileAsync('which', [command]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Single-quote a string for safe interpolation into an sh -c script. */
+function shQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
 
 interface CertificateKeyPair {
   cert: string;
@@ -146,12 +186,100 @@ async function isCertTrusted(certPath: string): Promise<boolean> {
       const { stdout } = await execFileAsync('certutil', ['-user', '-verifystore', 'Root', 'BSV Desktop']);
       return stdout.includes('BSV Desktop');
     } else {
-      // Linux: Various cert stores, hard to check reliably
-      return false;
+      return await isCertTrustedLinux(certPath);
     }
   } catch {
     return false;
   }
+}
+
+/**
+ * Linux trust check. Compares the SHA-256 fingerprint of the cert we generated
+ * against whatever is installed, so a stale anchor from a previous cert (e.g.
+ * after expiry regeneration) correctly reports as untrusted.
+ */
+async function isCertTrustedLinux(certPath: string): Promise<boolean> {
+  let expected: string;
+  try {
+    expected = certFingerprint(fs.readFileSync(certPath, 'utf8'));
+  } catch {
+    return false;
+  }
+
+  // System store (OpenSSL clients, and Chrome via the p11-kit NSS module)
+  try {
+    if (fs.existsSync(LINUX_CA_PATH)) {
+      if (certFingerprint(fs.readFileSync(LINUX_CA_PATH, 'utf8')) === expected) {
+        return true;
+      }
+    }
+  } catch {
+    // Unreadable or malformed anchor — fall through to the NSS check
+  }
+
+  // NSS user db (Chrome/Chromium)
+  try {
+    const { stdout } = await execFileAsync('certutil', [
+      '-d', LINUX_NSSDB, '-L', '-n', NSS_NICKNAME, '-a'
+    ]);
+    if (certFingerprint(stdout) === expected) {
+      return true;
+    }
+  } catch {
+    // certutil missing, db absent, or nickname not present
+  }
+
+  return false;
+}
+
+/**
+ * Adds the cert to the per-user NSS db that Chrome/Chromium read.
+ * Requires libnss3-tools; no root needed. Returns false if unavailable.
+ */
+async function installCertLinuxNss(certPath: string): Promise<boolean> {
+  if (!(await hasCommand('certutil'))) {
+    return false;
+  }
+
+  fs.mkdirSync(LINUX_NSSDB_DIR, { recursive: true });
+
+  if (!fs.existsSync(path.join(LINUX_NSSDB_DIR, 'cert9.db'))) {
+    await execFileAsync('certutil', ['-d', LINUX_NSSDB, '-N', '--empty-password']);
+  }
+
+  // Remove any anchor from a previous cert before adding the current one
+  try {
+    await execFileAsync('certutil', ['-d', LINUX_NSSDB, '-D', '-n', NSS_NICKNAME]);
+  } catch {
+    // Nothing to remove
+  }
+
+  // 'P,,' is trusted-peer for SSL, which is what this cert needs: it is a
+  // self-signed leaf (CA:FALSE), not a CA, so 'C,,' would have NSS try to
+  // build a chain through it and fail.
+  await execFileAsync('certutil', [
+    '-d', LINUX_NSSDB, '-A', '-t', 'P,,', '-n', NSS_NICKNAME, '-i', certPath
+  ]);
+  return true;
+}
+
+/**
+ * Copies the cert into the system trust store via a single pkexec prompt.
+ * Returns false if pkexec is unavailable.
+ */
+async function installCertLinuxSystem(certPath: string): Promise<boolean> {
+  if (!(await hasCommand('pkexec'))) {
+    return false;
+  }
+
+  const script = [
+    `mkdir -p ${shQuote(LINUX_CA_DIR)}`,
+    `install -m 644 ${shQuote(certPath)} ${shQuote(LINUX_CA_PATH)}`,
+    'update-ca-certificates'
+  ].join(' && ');
+
+  await execFileAsync('pkexec', ['sh', '-c', script]);
+  return true;
 }
 
 /**
@@ -175,24 +303,44 @@ Certificate location: ${certPath}`;
 
 Certificate location: ${certPath}`;
   } else {
-    // Linux
-    instructions = `To trust the certificate, please run the following commands:
+    // Linux: auto-install needs pkexec (system store) or certutil (NSS/Chrome).
+    // Without either there is nothing to automate, so fall back to instructions.
+    canAutoInstall = (await hasCommand('pkexec')) || (await hasCommand('certutil'));
+    instructions = canAutoInstall
+      ? `To trust the certificate, you'll be prompted for your password to add it to the system trust store.
 
-sudo cp "${certPath}" /usr/local/share/ca-certificates/bsv-desktop.crt
-sudo update-ca-certificates
+Certificate location: ${certPath}`
+      : `To trust the certificate, please run the following commands:
+
+${linuxManualCommand(certPath)}
 
 Certificate location: ${certPath}`;
   }
+
+  const manualLinuxFallback = platform !== 'darwin' && platform !== 'win32' && !canAutoInstall;
+
+  const buttons = canAutoInstall
+    ? ['Trust Certificate', 'Not Now']
+    : manualLinuxFallback ? ['Copy Command', 'OK'] : ['OK'];
 
   const response = await dialog.showMessageBox({
     type: 'info',
     title: 'SSL Certificate Trust',
     message: 'BSV Desktop uses HTTPS for secure communication',
     detail: instructions,
-    buttons: canAutoInstall ? ['Trust Certificate', 'Not Now'] : ['OK'],
+    buttons,
     defaultId: 0,
-    cancelId: 1
+    cancelId: buttons.length - 1
   });
+
+  // Linux without automation: offer the command via the clipboard, since the
+  // text in this dialog is not selectable on GTK.
+  if (manualLinuxFallback) {
+    if (response.response === 0) {
+      clipboard.writeText(linuxManualCommand(certPath));
+    }
+    return true;
+  }
 
   // User clicked "Not Now" or dismissed
   if (response.response !== 0) {
@@ -238,17 +386,55 @@ Certificate location: ${certPath}`;
       // });
 
       return true;
+    } else {
+      // Linux: write to both stores. The NSS db covers Chrome/Chromium and
+      // needs no root, so try it first — if it succeeds we still attempt the
+      // system store, but a pkexec failure there is no longer fatal.
+      let nssInstalled = false;
+      try {
+        nssInstalled = await installCertLinuxNss(certPath);
+      } catch (nssError) {
+        console.error('Failed to add certificate to NSS db:', nssError);
+      }
+
+      try {
+        await installCertLinuxSystem(certPath);
+      } catch (systemError) {
+        // pkexec exits 126 when the user dismisses the auth dialog — that is a
+        // deliberate choice, not a failure worth an error popup.
+        if ((systemError as { code?: number }).code === 126) {
+          console.log('User dismissed the pkexec authentication prompt');
+          return true;
+        }
+        if (!nssInstalled) {
+          throw systemError;
+        }
+        console.error('System trust store install failed, NSS db succeeded:', systemError);
+      }
+
+      return true;
     }
   } catch (error) {
     console.error('Failed to install certificate:', error);
 
-    await dialog.showMessageBox({
+    const isLinux = platform !== 'darwin' && platform !== 'win32';
+    const manualCommand = linuxManualCommand(certPath);
+
+    const failure = await dialog.showMessageBox({
       type: 'error',
       title: 'Certificate Installation Failed',
       message: 'Failed to install the certificate automatically.',
-      detail: `Please manually trust the certificate at:\n${certPath}\n\nError: ${error}`,
-      buttons: ['OK']
+      detail: isLinux
+        ? `Run these commands to trust it manually:\n\n${manualCommand}\n\nError: ${error}`
+        : `Please manually trust the certificate at:\n${certPath}\n\nError: ${error}`,
+      buttons: isLinux ? ['Copy Command', 'OK'] : ['OK'],
+      defaultId: 0,
+      cancelId: isLinux ? 1 : 0
     });
+
+    if (isLinux && failure.response === 0) {
+      clipboard.writeText(manualCommand);
+    }
 
     return false;
   }
