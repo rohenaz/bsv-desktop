@@ -3,7 +3,7 @@ import cors from 'cors';
 import { BrowserWindow } from 'electron';
 import { Server } from 'https';
 import https from 'https';
-import { generateSelfSignedCert, ensureCertTrusted } from './sslCert.js';
+import { generateSelfSignedCert, ensureCertTrusted, HTTPS_BRIDGE_PORT, HTTP_BRIDGE_PORT } from './sslCert.js';
 
 interface HttpRequestEvent {
   method: string;
@@ -47,6 +47,23 @@ function setCorsHeaders(res: Response): void {
 
 function canWriteResponse(res: Response): boolean {
   return !res.writableEnded && !res.destroyed && res.writable;
+}
+
+/**
+ * A local port the wallet bridge needs was already taken.
+ *
+ * Carries the port so the caller can say which one, rather than failing with a
+ * bare EADDRINUSE the user cannot act on.
+ */
+export class PortInUseError extends Error {
+  constructor(public readonly port: number) {
+    super(
+      `Port ${port} is already in use. BSV Desktop needs ports ${HTTPS_BRIDGE_PORT} and ${HTTP_BRIDGE_PORT} on `
+      + '127.0.0.1 for its local wallet bridge. This is usually another copy of '
+      + 'BSV Desktop already running, or other software holding the port.'
+    );
+    this.name = 'PortInUseError';
+  }
 }
 
 export async function startHttpServer(mainWindow: BrowserWindow): Promise<() => Promise<void>> {
@@ -268,28 +285,50 @@ export async function startHttpServer(mainWindow: BrowserWindow): Promise<() => 
   // Generate self-signed certificate
   const { cert, key, certPath } = await generateSelfSignedCert();
 
-  // Prompt user to trust certificate if needed
-  await ensureCertTrusted(certPath);
-
   // Start HTTPS server (2121) + HTTP fallback (3321)
   const server: Server = await new Promise((resolve, reject) => {
     const srv = https.createServer({ cert, key }, app);
 
-    srv.listen(2121, '127.0.0.1', () => {
-      console.log('HTTPS server listening on https://127.0.0.1:2121');
-      app.listen(3321, '127.0.0.1', () => {
-        console.log('HTTP server listening on http://127.0.0.1:3321');
-        resolve(srv);
-      });
-    });
-
-    srv.on('error', (error: NodeJS.ErrnoException) => {
+    // A port conflict used to call process.exit(1), killing the app instantly
+    // with nothing on screen — the user just saw BSV Desktop fail to open. That
+    // is a realistic scenario on managed machines, where security agents and
+    // other software claim unusual ports, and 2121 is a common alternate FTP
+    // port. Reject with something explanatory and let the caller decide.
+    const failWith = (port: number, error: NodeJS.ErrnoException) => {
       if (error.code === 'EADDRINUSE') {
-        console.error('Port 2121 is already in use!');
-        process.exit(1);
+        reject(new PortInUseError(port));
+        return;
       }
       reject(error);
+    };
+
+    srv.on('error', (error: NodeJS.ErrnoException) => failWith(HTTPS_BRIDGE_PORT, error));
+
+    srv.listen(HTTPS_BRIDGE_PORT, '127.0.0.1', () => {
+      console.log(`HTTPS server listening on https://127.0.0.1:${HTTPS_BRIDGE_PORT}`);
+
+      // The HTTP fallback needs the same treatment; its listen error was
+      // previously unhandled entirely.
+      const httpServer = app.listen(HTTP_BRIDGE_PORT, '127.0.0.1', () => {
+        console.log(`HTTP server listening on http://127.0.0.1:${HTTP_BRIDGE_PORT}`);
+        resolve(srv);
+      });
+
+      httpServer.on('error', (error: NodeJS.ErrnoException) => {
+        srv.close();
+        failWith(HTTP_BRIDGE_PORT, error);
+      });
     });
+  });
+
+  // Prompt the user to trust the certificate, once the main window is on screen.
+  //
+  // Deliberately not awaited: the servers are already listening, and startup
+  // must not block on a dialog the user may leave sitting there. Trusting the
+  // certificate affects whether clients accept the HTTPS endpoint, not whether
+  // it comes up.
+  void ensureCertTrusted(certPath, mainWindow).catch((error) => {
+    console.error('Certificate trust check failed:', error);
   });
 
   // Return cleanup function
