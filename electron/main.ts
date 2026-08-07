@@ -6,6 +6,7 @@ import fs from 'fs';
 import { startHttpServer, PortInUseError } from './httpServer.js';
 import { buildApplicationMenu } from './appMenu.js';
 import { applyPersistedProxySettings, registerNetworkIpc } from './networkSettings.js';
+import { integrateAppImageDesktopEntry } from './linuxDesktopIntegration.js';
 
 const require = createRequire(import.meta.url);
 
@@ -717,6 +718,11 @@ app.whenReady().then(async () => {
   } catch (error) {
     console.error('[Startup] Failed to apply persisted proxy settings, continuing startup without them:', error);
   }
+
+  // Must run before the window opens: the compositor resolves the icon when
+  // the toplevel is mapped, so a late-installed desktop entry is not picked up
+  // until the next launch.
+  integrateAppImageDesktopEntry();
 
   buildApplicationMenu({ getMainWindow: () => mainWindow });
   createWindow();
