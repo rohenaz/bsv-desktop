@@ -78,6 +78,10 @@ if (ymlFiles.length === 0) {
 
 let failures = 0;
 let checked = 0;
+/* Hash mismatches specifically, as opposed to artifacts that were not there at
+   all. The two have different causes and the summary should not blame signing
+   for a missing file. */
+let mismatches = 0;
 
 for (const ymlName of ymlFiles) {
   const ymlPath = path.join(releaseDir, ymlName);
@@ -89,6 +93,21 @@ for (const ymlName of ymlFiles) {
     failures++;
     continue;
   }
+
+  /*
+   * How many of THIS file's artifacts were actually hashed.
+   *
+   * Tracked per metadata file rather than globally because the skip below is
+   * legitimate — latest-mac.yml lists x64 and arm64, and a runner that built one
+   * arch cannot hash the other. What is never legitimate is a metadata file none
+   * of whose artifacts could be found: that is a release whose installer is
+   * missing or misnamed, and this script reporting success on it is the same
+   * silent pass it exists to prevent.
+   *
+   * Counts what was HASHED, not what passed — a mismatch is a failure that has
+   * already been reported, and counting it here too would report it twice.
+   */
+  let hashedHere = 0;
 
   for (const entry of entries) {
     const artifact = path.join(releaseDir, decodeURIComponent(entry.url));
@@ -103,6 +122,7 @@ for (const ymlName of ymlFiles) {
     }
 
     checked++;
+    hashedHere++;
     const actual = await sha512Base64(artifact);
     const sizeOk = entry.size == null || Number(entry.size) === stats.size;
 
@@ -112,6 +132,7 @@ for (const ymlName of ymlFiles) {
     }
 
     failures++;
+    mismatches++;
     console.error(`  FAIL  ${entry.url}`);
     console.error(`        expected sha512: ${entry.sha512}`);
     console.error(`        actual   sha512: ${actual}`);
@@ -120,15 +141,40 @@ for (const ymlName of ymlFiles) {
       console.error(`        actual   size:   ${stats.size}`);
     }
   }
+
+  if (hashedHere === 0) {
+    failures++;
+    console.error(
+      `  ERROR: ${ymlName} lists ${entries.length} artifact(s) and not one of them could be hashed.\n` +
+        '         Every entry was missing from this runner, so nothing was verified. An update\n' +
+        '         built from this directory would tell clients to download a file that is not there.'
+    );
+  }
 }
 
 console.log('');
 if (failures > 0) {
   console.error(
-    `Update metadata verification FAILED (${failures} mismatch(es) across ${checked} artifact(s)).\n` +
-      'An artifact was modified after electron-builder computed its hash — most likely code signing\n' +
-      'running as a separate step after the build. Sign inside electron-builder instead.'
+    `Update metadata verification FAILED (${failures} problem(s) across ${checked} artifact(s) hashed).`
   );
+  if (mismatches > 0) {
+    console.error(
+      'An artifact was modified after electron-builder computed its hash — most likely code signing\n' +
+        'running as a separate step after the build. Sign inside electron-builder instead.'
+    );
+  } else {
+    console.error(
+      'No hash mismatched; the artifacts named by the metadata were not found. Either the build did\n' +
+        'not produce them or something renamed or moved them after it did.'
+    );
+  }
+  process.exit(1);
+}
+
+if (checked === 0) {
+  // Belt and braces on top of the per-file check above: a run that hashed nothing
+  // at all has proved nothing at all, whatever the reason.
+  console.error('Update metadata verification checked NOTHING — refusing to report success.');
   process.exit(1);
 }
 
