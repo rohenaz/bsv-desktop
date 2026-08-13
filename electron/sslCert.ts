@@ -319,15 +319,30 @@ async function isCertAcceptedByClients(): Promise<boolean | null> {
     });
 
     request.on('error', (error: Error & { code?: string }) => {
-      const code = error.code ?? '';
-      // Connection-level failures mean the server is not reachable yet, which
-      // says nothing about trust. Certificate failures are a real answer.
-      if (code === 'ECONNREFUSED' || code === 'ECONNRESET' || code === 'ENOTFOUND') {
-        console.log(`Certificate probe inconclusive (${code}): bridge not reachable`);
+      // Electron's net module reports Chromium errors as `net::ERR_…` in
+      // `error.message` and often leaves `error.code` unset. Classify from
+      // both so a connection failure cannot be mistaken for a trust failure.
+      const token = `${error.code ?? ''} ${error.message ?? ''}`;
+      const inconclusive = [
+        'ECONNREFUSED',
+        'ECONNRESET',
+        'ENOTFOUND',
+        'ETIMEDOUT',
+        'ERR_CONNECTION_REFUSED',
+        'ERR_CONNECTION_RESET',
+        'ERR_NAME_NOT_RESOLVED',
+        'ERR_ADDRESS_UNREACHABLE',
+        'ERR_CONNECTION_TIMED_OUT',
+        'ERR_EMPTY_RESPONSE',
+        'ERR_ABORTED'
+      ];
+      if (inconclusive.some((marker) => token.includes(marker))) {
+        const label = error.code || error.message || 'unreachable';
+        console.log(`Certificate probe inconclusive (${label}): bridge not reachable`);
         finish(null);
         return;
       }
-      console.log(`Certificate probe rejected the endpoint: ${code || error.message}`);
+      console.log(`Certificate probe rejected the endpoint: ${error.code || error.message}`);
       finish(false);
     });
 
@@ -346,11 +361,12 @@ async function isCertAcceptedByClients(): Promise<boolean | null> {
 async function isCertTrusted(certPath: string): Promise<boolean> {
   try {
     if (process.platform === 'darwin') {
-      // macOS: Check if cert is in user keychain (CN is "localhost", not org name)
-      const loginKeychain = path.join(os.homedir(), 'Library/Keychains/login.keychain-db');
-      await execFileAsync('security', ['find-certificate', '-c', 'localhost', '-p', loginKeychain]);
-      // Also verify it's actually trusted, not just present
-      await execFileAsync('security', ['verify-cert', '-c', certPath, '-p', 'ssl', '-s', 'localhost']);
+      // verify-cert consults the default keychain search list (login + System)
+      // and both trust domains. The cert may have been installed into the
+      // System keychain via the admin fallback, so a login-keychain
+      // find-certificate is not a valid gate — it would report a successfully
+      // installed System cert as untrusted.
+      await execFileAsync('security', ['verify-cert', '-c', certPath, '-p', 'ssl', '-n', 'localhost']);
       return true;
     } else if (process.platform === 'win32') {
       // Windows: look the certificate up in the user's trusted root store by its
@@ -624,12 +640,14 @@ Certificate location: ${certPath}`;
 
   try {
     if (platform === 'darwin') {
-      // macOS: add-trusted-cert with -d flag adds to admin trust settings (needs auth prompt)
-      // First try without sudo — works if user has keychain access
+      // User trust domain first. `-d` writes admin trust settings and needs an
+      // authorization prompt that a child process cannot present, so pairing it
+      // with the login keychain usually fails and forced the System-keychain
+      // fallback even for unprivileged users.
       const loginKeychain = path.join(os.homedir(), 'Library/Keychains/login.keychain-db');
       try {
         await execFileAsync('security', [
-          'add-trusted-cert', '-d', '-r', 'trustRoot', '-k', loginKeychain, certPath
+          'add-trusted-cert', '-r', 'trustRoot', '-p', 'ssl', '-k', loginKeychain, certPath
         ]);
       } catch (firstErr) {
         console.log('Direct trust failed, trying with osascript admin prompt...');
@@ -637,7 +655,7 @@ Certificate location: ${certPath}`;
         // `security` with administrator privileges; build it from a JSON-quoted
         // path so shell metacharacters in certPath cannot break out of the string.
         const innerCmd =
-          'security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain '
+          'security add-trusted-cert -d -r trustRoot -p ssl -k /Library/Keychains/System.keychain '
           + JSON.stringify(certPath);
         await execFileAsync('osascript', [
           '-e', `do shell script ${JSON.stringify(innerCmd)} with administrator privileges`
@@ -761,14 +779,31 @@ export async function ensureCertTrusted(
   // Verify against a real client again, not just the store. On managed Windows
   // machines the two can disagree: the certificate is genuinely in the store
   // and genuinely not honoured.
+  //
+  // On macOS they also disagree, but the other way around. Chromium loads
+  // keychain trust at process start and does not pick up an add-trusted-cert
+  // that just ran in this same process. The probe then returns
+  // ERR_CERT_AUTHORITY_INVALID even though `security verify-cert` succeeds
+  // and a fresh process accepts the endpoint. Treat a verified store as
+  // success everywhere except Windows, where that combination is the policy
+  // case the warning exists for.
   const nowAccepted = await isCertAcceptedByClients();
   if (nowAccepted === true) {
     console.log('Certificate successfully installed and verified');
     return;
   }
 
-  if (nowAccepted === null && await isCertTrusted(certPath)) {
-    console.log('Certificate installed; endpoint not reachable to confirm end to end');
+  if (await isCertTrusted(certPath)) {
+    if (nowAccepted === false && process.platform === 'win32') {
+      console.log('Certificate install reported success but verification failed');
+      await explainVerificationFailure(certPath, parentWindow);
+      return;
+    }
+    console.log(
+      nowAccepted === null
+        ? 'Certificate installed; endpoint not reachable to confirm end to end'
+        : 'Certificate installed; network stack will honour it after restart'
+    );
     return;
   }
 
