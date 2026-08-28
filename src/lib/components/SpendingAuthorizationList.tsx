@@ -8,7 +8,8 @@ import { FC, useCallback, useContext, useEffect, useMemo, useRef, useState } fro
 import { toast } from 'react-toastify';
 import AmountDisplay from './AmountDisplay';
 import { WalletContext } from '../WalletContext';
-import { PermissionToken, Services } from '@bsv/wallet-toolbox-client';
+import { PermissionToken } from '@bsv/wallet-toolbox-client';
+import { createServices } from '../services/createServices';
 // NOTE: rely on the same exchange-rate provider used by AmountDisplay
 import { ExchangeRateContext } from './AmountDisplay/ExchangeRateContextProvider';
 import AppLogo from './AppLogo';
@@ -141,7 +142,7 @@ export const SpendingAuthorizationList: FC<Props> = ({
   //   MISC
   // --------------------------------------------------------------------------
   const cacheKey = app + activeProfile.id;
-  const services = useMemo(() => new Services('main'), []); // keep if other code relies on this instantiation
+  const services = useMemo(() => createServices('main'), []); // keep if other code relies on this instantiation
   const prevRqRef = useRef<number>(spendingRequests.length);
 
   // --------------------------------------------------------------------------
