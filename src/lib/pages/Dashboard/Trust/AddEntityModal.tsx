@@ -112,10 +112,15 @@ const AddEntityModal = ({
       setIdentityKey('')
       setFieldsValid(false)
       setOpen(false)
-      return [
-        { name, iconUrl: icon, description, identityKey, trust: 5 } as Certifier,
-        ...t
-      ]
+      // Typed (not cast) so a field-name drift against Certifier fails to compile.
+      const certifier: Certifier = {
+        name,
+        description,
+        iconUrl: icon,
+        identityKey,
+        trust: 5
+      }
+      return [certifier, ...t]
     })
   }
 
