@@ -113,7 +113,7 @@ const AddEntityModal = ({
       setFieldsValid(false)
       setOpen(false)
       return [
-        { name, icon, description, identityKey, trust: 5 } as Certifier,
+        { name, iconUrl: icon, description, identityKey, trust: 5 } as Certifier,
         ...t
       ]
     })
